@@ -3,6 +3,7 @@ import express from 'express';
 import { MongoClient } from 'mongodb';
 import 'dotenv/config';
 import cors from 'cors'
+import { ObjectId } from 'mongodb';
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -13,9 +14,9 @@ app.use(cors());
 // MongoDB Client
 const client = new MongoClient(process.env.MONGODB_URI);
 let addBookCollection;
-let newBooksCollection;
+
 let borrowsCollection;
-let booksCollection;
+
 
 // Database Connection
 export async function connectToMongoDB() {
@@ -38,11 +39,12 @@ export async function disconnectFromMongoDB() {
 }
 app.post('/add-destination', async (req, res) => {
   try {
-    const data = req.body;
+    const data = {
+      ...req.body,
+      createdAt: new Date(),
+    };
 
     const result = await addBookCollection.insertOne(data);
-
-    console.log(result);
 
     res.status(201).send(result);
   } catch (error) {
@@ -64,21 +66,38 @@ app.get('/my-book', async(req, res)=>{
 // New Arrivals API
 app.get("/books/latest", async (req, res) => {
   try {
-    const books = await newBooksCollection.find().sort({ createdAt: -1 }).limit(6).toArray();
+    const books = await addBookCollection
+      .find()
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(6)
+      .toArray();
 
     res.status(200).send(books);
   } catch (error) {
     console.error("Latest Books Error:", error);
 
     res.status(500).send({
-      message: "Failed to fetch books",
+      message: "Failed to fetch latest books",
     });
   }
 });
+
 // All Books API
 app.get("/books", async (req, res) => {
-  const books = await booksCollection.find().toArray();
-  res.send(books);
+  try {
+    const books = await addBookCollection
+      .find()
+      .sort({ _id: -1 })
+      .toArray();
+
+    res.status(200).send(books);
+  } catch (error) {
+    console.error("All Books Error:", error);
+
+    res.status(500).send({
+      message: "Failed to fetch books",
+    });
+  }
 });
 
 
@@ -100,6 +119,35 @@ app.get("/my-borrows", async (req, res) => {
   }
 });
 
+// Details API
+app.get("/books/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid book ID",
+      });
+    }
+
+    const book = await addBookCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!book) {
+      return res.status(404).send({
+        message: "Book not found",
+      });
+    }
+
+    res.status(200).send(book);
+  } catch (error) {
+    res.status(500).send({
+      message: "Failed to fetch book",
+    });
+  }
+});
+
 // http://localhost:8000/add-destination
 app.get('/', (req, res) => {
   res.send('Hello World!');
@@ -111,8 +159,6 @@ async function startServer() {
    const mongoClient = await connectToMongoDB();
    const db =mongoClient.db("Bookk-Nook")
     addBookCollection = db.collection("Add-Book")
-    newBooksCollection = db.collection("New-Book");
-    booksCollection = db.collection("AllBooks");
     borrowsCollection = db.collection("Borrows");
 
     app.listen(PORT, () => {
