@@ -23,7 +23,7 @@ const clientOrigins = (
   .filter(Boolean);
 
 // Base URL of the Better Auth server (the Next.js app).
-const authBaseUrl = (process.env.BETTER_AUTH_URL || 'http://localhost:3000')
+const authBaseUrl = (process.env.BETTER_AUTH_URL || `${process.env.CLIENT_URI}`)
   .trim()
   .replace(/\/$/, '');
 const jwksUrl = `${authBaseUrl}/api/auth/jwks`;
