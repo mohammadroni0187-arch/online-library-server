@@ -21,14 +21,37 @@ const clientOrigins = (
   .map((origin) => origin.trim().replace(/\/$/, ''))
   .filter(Boolean);
 
-const authBaseUrl = (
+if (clientOrigins.length === 0) {
+  console.warn(
+    '[BookNook] No client origin configured. Set CLIENT_ORIGINS ' +
+      '(comma-separated) or BETTER_AUTH_URL, otherwise browser requests ' +
+      'from the frontend will be blocked by CORS.'
+  );
+  // Local development fallback so `next dev` on :3000 keeps working even
+  // when the environment variables are missing.
+  clientOrigins.push('http://localhost:3000');
+}
+
+const configuredAuthBaseUrl = (
   process.env.BETTER_AUTH_URL ||
   process.env.CLIENT_URI ||
-  'http://localhost:3000'
+  ''
 )
   .trim()
   .replace(/\/$/, '');
 
+const authBaseUrl =
+  configuredAuthBaseUrl || 'http://localhost:3000';
+
+if (!configuredAuthBaseUrl) {
+  console.warn(
+    '[BookNook] BETTER_AUTH_URL is not set. JWT verification will use ' +
+      'http://localhost:3000 (issuer/audience/JWKS), which will fail in ' +
+      'production.'
+  );
+}
+
+// Better Auth serves its public keys here (JWT plugin, default path).
 const jwksUrl = `${authBaseUrl}/api/auth/jwks`;
 
 const BOOK_CATEGORIES = [
@@ -130,7 +153,13 @@ async function getCollections() {
 }
 
 // Every API route below this middleware gets database access.
+// CORS preflight requests (OPTIONS) are answered by the cors middleware
+// above and never need a database connection.
 app.use(async (req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+
   try {
     await getCollections();
     next();
