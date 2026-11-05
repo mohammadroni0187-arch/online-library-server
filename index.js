@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 8000;
 const clientOrigins = (
   process.env.CLIENT_ORIGINS ||
   process.env.BETTER_AUTH_URL ||
-  'http://localhost:3000'
+  `${process.env.Client_URI}`
 )
   .split(',')
   .map((origin) => origin.trim().replace(/\/$/, ''))
