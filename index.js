@@ -777,6 +777,4 @@ app.use((req, res) => {
 // Do not use app.listen() here.
 // Vercel will call this handler for incoming requests.
 
-export default function handler(req, res) {
-  return app(req, res);
-}
+export default app;
