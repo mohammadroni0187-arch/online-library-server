@@ -6,33 +6,39 @@ import cors from 'cors';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const app = express();
-const PORT = process.env.PORT || 8000;
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-// The Next.js client that is allowed to call this API (comma separated).
 const clientOrigins = (
   process.env.CLIENT_ORIGINS ||
   process.env.BETTER_AUTH_URL ||
-  `${process.env.CLIENT_URI}`
+  process.env.CLIENT_URI ||
+  ''
 )
   .split(',')
   .map((origin) => origin.trim().replace(/\/$/, ''))
   .filter(Boolean);
 
-// Base URL of the Better Auth server (the Next.js app).
-const authBaseUrl = (process.env.BETTER_AUTH_URL || `${process.env.CLIENT_URI}`)
+const authBaseUrl = (
+  process.env.BETTER_AUTH_URL ||
+  process.env.CLIENT_URI ||
+  'http://localhost:3000'
+)
   .trim()
   .replace(/\/$/, '');
+
 const jwksUrl = `${authBaseUrl}/api/auth/jwks`;
 
-const BOOK_CATEGORIES = ['Fiction', 'Science', 'History', 'Kids', 'Others'];
+const BOOK_CATEGORIES = [
+  'Fiction',
+  'Science',
+  'History',
+  'Kids',
+  'Others',
+];
 
-// Fields a client is allowed to change on a book. Identity fields
-// (userName / userEmail / userId / availableCopies / createdAt) are never
-// taken from the request body.
 const EDITABLE_BOOK_FIELDS = [
   'title',
   'author',
@@ -42,47 +48,103 @@ const EDITABLE_BOOK_FIELDS = [
   'totalCopies',
 ];
 
+// ---------------------------------------------------------------------------
 // Middleware
-app.use(express.json());
-app.use(cors({ origin: clientOrigins }));
+// ---------------------------------------------------------------------------
 
-// MongoDB Client
-const client = new MongoClient(process.env.MONGODB_URI);
-let mongoClient;
+app.use(express.json());
+
+app.use(
+  cors({
+    origin: clientOrigins,
+  })
+);
+
+// Health-check route.
+// This route does not need a MongoDB connection.
+app.get('/', (req, res) => {
+  res.status(200).send('BookNook API is running');
+});
+
+// ---------------------------------------------------------------------------
+// MongoDB Connection
+// ---------------------------------------------------------------------------
+
+const MONGODB_URI = process.env.MONGODB_URI;
+
+let client;
+let dbPromise;
+
 let addBookCollection;
 let borrowsCollection;
 
-// ---------------------------------------------------------------------------
-// Database Connection
-// ---------------------------------------------------------------------------
-
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-
-    console.log('Successfully connected to MongoDB!');
-
-    return client;
-  } catch (err) {
-    console.error('MongoDB connection failed:', err);
-    throw err;
+async function connectToMongoDB() {
+  if (!MONGODB_URI) {
+    throw new Error('MONGODB_URI is missing from environment variables');
   }
+
+  if (!client) {
+    client = new MongoClient(MONGODB_URI);
+  }
+
+  await client.connect();
+
+  console.log('Successfully connected to MongoDB!');
+
+  return client;
 }
 
-// Disconnect
-export async function disconnectFromMongoDB() {
-  await client.close();
-  console.log('MongoDB disconnected!');
+async function getCollections() {
+  if (!dbPromise) {
+    dbPromise = (async () => {
+      const mongoClient = await connectToMongoDB();
+
+      const db = mongoClient.db('Bookk-Nook');
+
+      addBookCollection = db.collection('Add-Book');
+      borrowsCollection = db.collection('Borrows');
+
+      try {
+        await borrowsCollection.createIndex(
+          { bookId: 1, userEmail: 1 },
+          { unique: true }
+        );
+      } catch (error) {
+        console.warn(
+          'Could not create borrow index:',
+          error.message
+        );
+      }
+
+      return {
+        addBookCollection,
+        borrowsCollection,
+      };
+    })().catch((error) => {
+      dbPromise = null;
+      throw error;
+    });
+  }
+
+  return dbPromise;
 }
+
+// Every API route below this middleware gets database access.
+app.use(async (req, res, next) => {
+  try {
+    await getCollections();
+    next();
+  } catch (error) {
+    console.error('Database connection error:', error);
+
+    res.status(500).send({
+      message: 'Database connection failed',
+    });
+  }
+});
 
 // ---------------------------------------------------------------------------
-// JWT verification
-//
-// Better Auth issues the JWT (GET /api/auth/token) and publishes the public
-// keys used to sign it at GET /api/auth/jwks. This middleware verifies the
-// signature, the expiry, the issuer and the audience of the token and puts the
-// authenticated identity on req.user. Nothing sent by the client is trusted as
-// proof of identity.
+// JWT Verification
 // ---------------------------------------------------------------------------
 
 let jwksSet = null;
@@ -90,10 +152,11 @@ let jwksSet = null;
 function getJwks() {
   if (!jwksSet) {
     jwksSet = createRemoteJWKSet(new URL(jwksUrl), {
-      cooldownDuration: 30_000,
-      cacheMaxAge: 600_000,
+      cooldownDuration: 30000,
+      cacheMaxAge: 600000,
     });
   }
+
   return jwksSet;
 }
 
@@ -137,10 +200,17 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// Only the user who added a book may edit or delete it.
+// ---------------------------------------------------------------------------
+// Helper Functions
+// ---------------------------------------------------------------------------
+
 function ownsBook(book, user) {
   if (!book || !user) return false;
-  if (book.userId && String(book.userId) === user.id) return true;
+
+  if (book.userId && String(book.userId) === user.id) {
+    return true;
+  }
+
   return book.userEmail === user.email;
 }
 
@@ -149,48 +219,75 @@ function isValidId(id) {
 }
 
 function readBookPayload(data = {}) {
-  const title = typeof data.title === 'string' ? data.title.trim() : '';
-  const author = typeof data.author === 'string' ? data.author.trim() : '';
+  const title =
+    typeof data.title === 'string' ? data.title.trim() : '';
+
+  const author =
+    typeof data.author === 'string' ? data.author.trim() : '';
+
   const category =
     typeof data.category === 'string' ? data.category.trim() : '';
-  const image = typeof data.image === 'string' ? data.image.trim() : '';
+
+  const image =
+    typeof data.image === 'string' ? data.image.trim() : '';
+
   const description =
-    typeof data.description === 'string' ? data.description.trim() : '';
+    typeof data.description === 'string'
+      ? data.description.trim()
+      : '';
+
   const totalCopies = Number(data.totalCopies);
 
   const errors = [];
 
   if (!title) errors.push('Book title is required');
+
   if (!author) errors.push('Author name is required');
+
   if (!BOOK_CATEGORIES.includes(category)) {
-    errors.push(`Category must be one of: ${BOOK_CATEGORIES.join(', ')}`);
+    errors.push(
+      `Category must be one of: ${BOOK_CATEGORIES.join(', ')}`
+    );
   }
+
   if (!image) errors.push('Book cover image is required');
+
   if (!Number.isFinite(totalCopies) || totalCopies < 1) {
     errors.push('Total copies must be at least 1');
   }
 
-  return { errors, value: { title, author, category, image, description, totalCopies } };
+  return {
+    errors,
+    value: {
+      title,
+      author,
+      category,
+      image,
+      description,
+      totalCopies,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Books
 // ---------------------------------------------------------------------------
 
-// Add Book API (POST /books) - the legacy path stays available for
-// compatibility with older clients, both routes share the same handler.
+// Add Book
+
 async function addBookHandler(req, res) {
   try {
     const { errors, value } = readBookPayload(req.body);
 
     if (errors.length > 0) {
-      return res.status(400).send({ message: errors.join(', ') });
+      return res.status(400).send({
+        message: errors.join(', '),
+      });
     }
 
     const bookData = {
       ...value,
       availableCopies: value.totalCopies,
-      // Identity always comes from the verified token, never from the body.
       userName: req.user.name,
       userEmail: req.user.email,
       userId: req.user.id,
@@ -199,24 +296,24 @@ async function addBookHandler(req, res) {
 
     const result = await addBookCollection.insertOne(bookData);
 
-    res.status(201).send({
+    return res.status(201).send({
       message: 'Book added successfully',
       insertedId: result.insertedId,
     });
   } catch (error) {
     console.error('Add Book Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to add book',
     });
   }
 }
 
 app.post('/books', requireAuth, addBookHandler);
-// Legacy endpoint kept so existing clients keep working.
 app.post('/add-destination', requireAuth, addBookHandler);
 
-// New Arrivals API - must be registered before GET /books/:id
+// Latest Books
+
 app.get('/books/latest', async (req, res) => {
   try {
     const latestBooks = await addBookCollection
@@ -225,21 +322,25 @@ app.get('/books/latest', async (req, res) => {
       .limit(6)
       .toArray();
 
-    res.status(200).send(latestBooks);
+    return res.status(200).send(latestBooks);
   } catch (error) {
     console.error('Latest Books Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to fetch latest books',
     });
   }
 });
 
-// All Books API (optional ?category= filter)
+// All Books
+
 app.get('/books', async (req, res) => {
   try {
     const category =
-      typeof req.query.category === 'string' ? req.query.category.trim() : '';
+      typeof req.query.category === 'string'
+        ? req.query.category.trim()
+        : '';
+
     const filter = category ? { category } : {};
 
     const books = await addBookCollection
@@ -247,17 +348,18 @@ app.get('/books', async (req, res) => {
       .sort({ _id: -1 })
       .toArray();
 
-    res.status(200).send(books);
+    return res.status(200).send(books);
   } catch (error) {
     console.error('All Books Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to fetch books',
     });
   }
 });
 
-// Book Details API
+// Book Details
+
 app.get('/books/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -278,17 +380,18 @@ app.get('/books/:id', async (req, res) => {
       });
     }
 
-    res.status(200).send(book);
+    return res.status(200).send(book);
   } catch (error) {
     console.error('Book Details API Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to fetch book',
     });
   }
 });
 
-// Update Book API - only the owner may update, only known fields change.
+// Update Book
+
 app.patch('/books/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -299,7 +402,9 @@ app.patch('/books/:id', requireAuth, async (req, res) => {
       });
     }
 
-    const book = await addBookCollection.findOne({ _id: new ObjectId(id) });
+    const book = await addBookCollection.findOne({
+      _id: new ObjectId(id),
+    });
 
     if (!book) {
       return res.status(404).send({
@@ -317,7 +422,9 @@ app.patch('/books/:id', requireAuth, async (req, res) => {
     const update = {};
 
     for (const field of EDITABLE_BOOK_FIELDS) {
-      if (body[field] !== undefined) update[field] = body[field];
+      if (body[field] !== undefined) {
+        update[field] = body[field];
+      }
     }
 
     if (Object.keys(update).length === 0) {
@@ -326,13 +433,17 @@ app.patch('/books/:id', requireAuth, async (req, res) => {
       });
     }
 
-    const { errors, value } = readBookPayload({ ...book, ...update });
+    const { errors, value } = readBookPayload({
+      ...book,
+      ...update,
+    });
 
     if (errors.length > 0) {
-      return res.status(400).send({ message: errors.join(', ') });
+      return res.status(400).send({
+        message: errors.join(', '),
+      });
     }
 
-    // Keep the book counts consistent with the active borrow records.
     const borrowedCount = await borrowsCollection.countDocuments({
       bookId: id,
     });
@@ -343,7 +454,11 @@ app.patch('/books/:id', requireAuth, async (req, res) => {
     update.image = value.image;
     update.description = value.description;
     update.totalCopies = value.totalCopies;
-    update.availableCopies = Math.max(0, value.totalCopies - borrowedCount);
+
+    update.availableCopies = Math.max(
+      0,
+      value.totalCopies - borrowedCount
+    );
 
     const result = await addBookCollection.updateOne(
       { _id: new ObjectId(id) },
@@ -356,20 +471,21 @@ app.patch('/books/:id', requireAuth, async (req, res) => {
       });
     }
 
-    res.status(200).send({
+    return res.status(200).send({
       message: 'Book updated successfully',
       result,
     });
   } catch (error) {
     console.error('PATCH API Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to update book',
     });
   }
 });
 
-// Delete Book API - only the owner may delete.
+// Delete Book
+
 app.delete('/books/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -380,7 +496,9 @@ app.delete('/books/:id', requireAuth, async (req, res) => {
       });
     }
 
-    const book = await addBookCollection.findOne({ _id: new ObjectId(id) });
+    const book = await addBookCollection.findOne({
+      _id: new ObjectId(id),
+    });
 
     if (!book) {
       return res.status(404).send({
@@ -394,9 +512,9 @@ app.delete('/books/:id', requireAuth, async (req, res) => {
       });
     }
 
-    // Remove borrow records that point at the deleted book so no dangling
-    // reference is left behind.
-    await borrowsCollection.deleteMany({ bookId: id });
+    await borrowsCollection.deleteMany({
+      bookId: id,
+    });
 
     const result = await addBookCollection.deleteOne({
       _id: new ObjectId(id),
@@ -408,19 +526,20 @@ app.delete('/books/:id', requireAuth, async (req, res) => {
       });
     }
 
-    res.status(200).send({
+    return res.status(200).send({
       message: 'Book deleted successfully',
     });
   } catch (error) {
     console.error('Delete Book Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to delete book',
     });
   }
 });
 
-// My Books API - identity comes from the verified token.
+// My Books
+
 app.get('/my-book', requireAuth, async (req, res) => {
   try {
     const result = await addBookCollection
@@ -428,11 +547,11 @@ app.get('/my-book', requireAuth, async (req, res) => {
       .sort({ _id: -1 })
       .toArray();
 
-    res.status(200).send(result);
+    return res.status(200).send(result);
   } catch (error) {
     console.error('My Books Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to fetch books',
     });
   }
@@ -442,13 +561,16 @@ app.get('/my-book', requireAuth, async (req, res) => {
 // Borrows
 // ---------------------------------------------------------------------------
 
-// Borrow a book: decrement stock atomically, then store the borrow record.
+// Borrow a Book
+
 app.post('/borrows', requireAuth, async (req, res) => {
   try {
     const { bookId, borrowDate, returnDate } = req.body || {};
 
     if (!isValidId(bookId)) {
-      return res.status(400).send({ message: 'Invalid book ID' });
+      return res.status(400).send({
+        message: 'Invalid book ID',
+      });
     }
 
     const book = await addBookCollection.findOne({
@@ -456,10 +578,11 @@ app.post('/borrows', requireAuth, async (req, res) => {
     });
 
     if (!book) {
-      return res.status(404).send({ message: 'Book not found' });
+      return res.status(404).send({
+        message: 'Book not found',
+      });
     }
 
-    // One active borrow per user and book.
     const existingBorrow = await borrowsCollection.findOne({
       bookId,
       userEmail: req.user.email,
@@ -471,13 +594,23 @@ app.post('/borrows', requireAuth, async (req, res) => {
       });
     }
 
-    const borrowedAt = borrowDate ? new Date(borrowDate) : new Date();
+    const borrowedAt = borrowDate
+      ? new Date(borrowDate)
+      : new Date();
+
     const dueAt = returnDate
       ? new Date(returnDate)
-      : new Date(borrowedAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+      : new Date(
+          borrowedAt.getTime() + 7 * 24 * 60 * 60 * 1000
+        );
 
-    if (Number.isNaN(borrowedAt.getTime()) || Number.isNaN(dueAt.getTime())) {
-      return res.status(400).send({ message: 'Invalid borrow or return date' });
+    if (
+      Number.isNaN(borrowedAt.getTime()) ||
+      Number.isNaN(dueAt.getTime())
+    ) {
+      return res.status(400).send({
+        message: 'Invalid borrow or return date',
+      });
     }
 
     if (dueAt.getTime() <= borrowedAt.getTime()) {
@@ -486,7 +619,6 @@ app.post('/borrows', requireAuth, async (req, res) => {
       });
     }
 
-    // Atomic decrement: never lets availableCopies go below 0.
     const stockResult = await addBookCollection.updateOne(
       {
         _id: new ObjectId(bookId),
@@ -521,11 +653,11 @@ app.post('/borrows', requireAuth, async (req, res) => {
         insertedId: result.insertedId,
       });
     } catch (insertError) {
-      // Give the copy back so the stock stays correct.
       await addBookCollection.updateOne(
         { _id: new ObjectId(bookId) },
         { $inc: { availableCopies: 1 } }
       );
+
       throw insertError;
     }
   } catch (error) {
@@ -537,7 +669,8 @@ app.post('/borrows', requireAuth, async (req, res) => {
   }
 });
 
-// Borrow records of the authenticated user.
+// Get My Borrows
+
 async function getMyBorrows(req, res) {
   try {
     const borrows = await borrowsCollection
@@ -545,22 +678,21 @@ async function getMyBorrows(req, res) {
       .sort({ _id: -1 })
       .toArray();
 
-    res.status(200).send(borrows);
+    return res.status(200).send(borrows);
   } catch (error) {
     console.error('My Borrows Error:', error);
 
-    res.status(500).send({
+    return res.status(500).send({
       message: 'Failed to get borrowed books',
     });
   }
 }
 
 app.get('/borrows', requireAuth, getMyBorrows);
-// Legacy path kept for existing clients.
 app.get('/my-borrows', requireAuth, getMyBorrows);
 
-// Return a book: only the owner of the record may return it, and the record is
-// removed atomically so the same borrow can never be returned twice.
+// Return a Book
+
 app.delete('/borrows/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -587,7 +719,6 @@ app.delete('/borrows/:id', requireAuth, async (req, res) => {
       });
     }
 
-    // Atomic claim: only one request can delete the record.
     const claimed = await borrowsCollection.findOneAndDelete({
       _id: new ObjectId(id),
       userEmail: req.user.email,
@@ -605,14 +736,14 @@ app.delete('/borrows/:id', requireAuth, async (req, res) => {
       });
 
       if (book) {
-        // Only increment while there is room left, so the count can never
-        // exceed totalCopies.
         await addBookCollection.updateOne(
           {
             _id: new ObjectId(borrow.bookId),
             availableCopies: { $lt: book.totalCopies },
           },
-          { $inc: { availableCopies: 1 } }
+          {
+            $inc: { availableCopies: 1 },
+          }
         );
       }
     }
@@ -630,48 +761,22 @@ app.delete('/borrows/:id', requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Misc
+// Unknown Routes
 // ---------------------------------------------------------------------------
 
-app.get('/', (req, res) => {
-  res.send('BookNook API is running');
-});
-
-// Unknown API routes
 app.use((req, res) => {
-  res.status(404).send({ message: 'Route not found' });
+  res.status(404).send({
+    message: 'Route not found',
+  });
 });
 
-// Start Server after Database Connection
-async function startServer() {
-  try {
-    mongoClient = await connectToMongoDB();
+// ---------------------------------------------------------------------------
+// Vercel Serverless Export
+// ---------------------------------------------------------------------------
 
-    // The books live in their own database next to the Better Auth database.
-    const db = mongoClient.db('Bookk-Nook');
+// Do not use app.listen() here.
+// Vercel will call this handler for incoming requests.
 
-    addBookCollection = db.collection('Add-Book');
-    borrowsCollection = db.collection('Borrows');
-
-    // A user may only hold one active borrow of the same book. Returning a
-    // book deletes the record, so the same book can be borrowed again later.
-    try {
-      await borrowsCollection.createIndex(
-        { bookId: 1, userEmail: 1 },
-        { unique: true }
-      );
-    } catch (indexError) {
-      console.warn('Could not create borrow index:', indexError.message);
-    }
-
-    app.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
-    });
-  } catch (error) {
-    console.error('Server failed to start:', error);
-    process.exit(1);
-  }
+export default function handler(req, res) {
+  return app(req, res);
 }
-
-startServer();
-export default app;
